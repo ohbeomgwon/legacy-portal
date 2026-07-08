@@ -12,6 +12,11 @@ import java.time.LocalDateTime;
  *        type:   1=지출, 2=휴가, 3=구매, 4=기타
  *        priority: 1=낮음, 2=보통, 3=높음
  * [스멜] 캡슐화 부재 — 모든 필드에 public setter. 누구나 상태를 마음대로 바꿀 수 있다.
+ *
+ * [리팩토링] status(int) → {@link ApprovalStatus} enum으로 전환. DB 컬럼·API 응답(JSON)의
+ *            정수값은 {@link ApprovalStatusConverter}·{@link ApprovalStatus#getCode()}로
+ *            기존과 동일하게 유지된다(자세한 이유는 ApprovalStatus 클래스 주석 참고).
+ *            type·priority는 이번 변경 범위 밖이라 아직 int 그대로다.
  */
 @Entity
 public class Approval {
@@ -23,7 +28,8 @@ public class Approval {
     private String title;
     private String content;
     private int type;       // 1=지출 2=휴가 3=구매 4=기타 (의미를 주석으로만 설명 → enum 후보)
-    private int status;     // 0=임시저장 1=상신 2=승인 3=반려 9=취소 (숫자만 저장 → 의미 증발)
+    @Convert(converter = ApprovalStatusConverter.class)
+    private ApprovalStatus status;   // [리팩토링] int(0/1/2/3/9) → enum. DB엔 정수 그대로 저장(Converter).
     private int priority;   // 1=낮음 2=보통 3=높음
     private Long drafterId;     // 기안자
     private Long approverId;    // 결재자
@@ -40,8 +46,8 @@ public class Approval {
     public void setContent(String content) { this.content = content; }
     public int getType() { return type; }
     public void setType(int type) { this.type = type; }
-    public int getStatus() { return status; }
-    public void setStatus(int status) { this.status = status; }
+    public ApprovalStatus getStatus() { return status; }
+    public void setStatus(ApprovalStatus status) { this.status = status; }
     public int getPriority() { return priority; }
     public void setPriority(int priority) { this.priority = priority; }
     public Long getDrafterId() { return drafterId; }

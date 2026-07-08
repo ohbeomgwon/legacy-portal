@@ -59,13 +59,13 @@ class ApprovalServiceProcessApprovalCharacterizationTest {
     @DisplayName("1) 상신 후 승인하면 상태가 SUBMITTED를 거쳐 APPROVED가 된다")
     void 상신후_승인하면_승인상태가_된다() {
         Approval 결재 = 임시저장_결재_생성(결재자.getId());
-        assertThat(결재.getStatus()).isEqualTo(0); // 생성 직후 = 임시저장
+        assertThat(결재.getStatus()).isEqualTo(ApprovalStatus.DRAFT); // 생성 직후 = 임시저장
 
         approvalService.processApproval(결재.getId(), 기안자.getId(), 1, ""); // 상신
-        assertThat(approvalRepository.findById(결재.getId()).orElseThrow().getStatus()).isEqualTo(1);
+        assertThat(approvalRepository.findById(결재.getId()).orElseThrow().getStatus()).isEqualTo(ApprovalStatus.SUBMITTED);
 
         approvalService.processApproval(결재.getId(), 결재자.getId(), 2, ""); // 승인
-        assertThat(approvalRepository.findById(결재.getId()).orElseThrow().getStatus()).isEqualTo(2);
+        assertThat(approvalRepository.findById(결재.getId()).orElseThrow().getStatus()).isEqualTo(ApprovalStatus.APPROVED);
     }
 
     @Test
@@ -77,7 +77,7 @@ class ApprovalServiceProcessApprovalCharacterizationTest {
         approvalService.processApproval(결재.getId(), 결재자.getId(), 3, "예산 초과"); // 반려
 
         Approval 결과 = approvalRepository.findById(결재.getId()).orElseThrow();
-        assertThat(결과.getStatus()).isEqualTo(3);
+        assertThat(결과.getStatus()).isEqualTo(ApprovalStatus.REJECTED);
         assertThat(결과.getRejectReason()).isEqualTo("예산 초과");
     }
 
@@ -88,7 +88,7 @@ class ApprovalServiceProcessApprovalCharacterizationTest {
 
         approvalService.processApproval(결재.getId(), 기안자.getId(), 9, ""); // 취소
 
-        assertThat(approvalRepository.findById(결재.getId()).orElseThrow().getStatus()).isEqualTo(9);
+        assertThat(approvalRepository.findById(결재.getId()).orElseThrow().getStatus()).isEqualTo(ApprovalStatus.CANCELED);
     }
 
     @Test
@@ -99,8 +99,8 @@ class ApprovalServiceProcessApprovalCharacterizationTest {
 
         approvalService.processApproval(결재.getId(), 권한없는결재자.getId(), 2, ""); // 승인 시도(권한 없음)
 
-        // 예외 없이 조용히 무시 — 상태가 그대로 SUBMITTED(1)에 머문다.
-        assertThat(approvalRepository.findById(결재.getId()).orElseThrow().getStatus()).isEqualTo(1);
+        // 예외 없이 조용히 무시 — 상태가 그대로 SUBMITTED에 머문다.
+        assertThat(approvalRepository.findById(결재.getId()).orElseThrow().getStatus()).isEqualTo(ApprovalStatus.SUBMITTED);
     }
 
     @Test
@@ -121,10 +121,10 @@ class ApprovalServiceProcessApprovalCharacterizationTest {
         Approval 결재 = 임시저장_결재_생성(결재자.getId());
         approvalService.processApproval(결재.getId(), 기안자.getId(), 1, ""); // 상신
         approvalService.processApproval(결재.getId(), 결재자.getId(), 2, ""); // 1차 승인
-        assertThat(approvalRepository.findById(결재.getId()).orElseThrow().getStatus()).isEqualTo(2);
+        assertThat(approvalRepository.findById(결재.getId()).orElseThrow().getStatus()).isEqualTo(ApprovalStatus.APPROVED);
 
         approvalService.processApproval(결재.getId(), 결재자.getId(), 2, ""); // 재승인 시도
 
-        assertThat(approvalRepository.findById(결재.getId()).orElseThrow().getStatus()).isEqualTo(2);
+        assertThat(approvalRepository.findById(결재.getId()).orElseThrow().getStatus()).isEqualTo(ApprovalStatus.APPROVED);
     }
 }

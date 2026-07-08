@@ -26,6 +26,20 @@ import java.util.List;
  * 10. Comment Smell        : 나쁜 이름을 주석으로 변명한다.
  * 11. No Tests             : 테스트가 단 한 개도 없다(안전망 부재).
  * =================================================================================
+ *
+ * [리팩토링] 스멜9(Poor Naming) 일부 해소 — d→approval, u→actor, s→status로 리네임하고
+ *            proc(action을 그대로 복사해 담던 임시변수)는 제거해 action을 직접 사용한다
+ *            (기법: Rename Variable / Remove Temp — 동작 변경 없음).
+ * [리팩토링] 스멜3·7(Magic Number/Primitive Obsession) 중 status 부분 해소 — status(int)를
+ *            {@link ApprovalStatus} enum으로 전환(기법: Replace Magic Number with Symbolic
+ *            Constant). DB 저장값·API 응답은 기존과 동일(자세한 내용은 ApprovalStatus 참고).
+ *            type·priority는 이번 변경 범위 밖이라 아직 int 그대로 남아 있다.
+ * [리팩토링] statusLabel()의 5분기 if-else 사다리와 tmp 임시변수를 제거하고, 라벨을
+ *            enum이 직접 소유(ApprovalStatus.label())하도록 위임(기법: Move Method /
+ *            Replace Conditional with Polymorphism의 단순화 버전). 상태값은 이제 enum이
+ *            보장하므로 레거시의 "알수없음" 폴백 분기는 도달 불가능해져 자연히 사라진다
+ *            (setStatus가 ApprovalStatus 타입만 받으므로 정의되지 않은 상태값 자체가 만들어질 수 없음).
+ * 위 변경 전후로 refactor/start 특성화 테스트 6개가 green 유지됨을 확인했다.
  */
 @Service
 public class ApprovalService {
@@ -45,25 +59,25 @@ public class ApprovalService {
     // [스멜8] 파라미터 8개. [스멜9] 이름이 모호하다.
     public Approval create(String title, String content, int type, int priority,
                            Long drafterId, Long approverId, long amount, boolean urgent) {
-        Approval d = new Approval();   // d = 결재 문서(Approval 객체)  [스멜9: document? draft? 약어라 의미 불명]
-        d.setTitle(title);
-        d.setContent(content);
-        d.setType(type);
-        d.setPriority(urgent ? 3 : priority);   // priority(우선순위): 1 낮음·2 보통·3 높음  [스멜3: 3=높음, 왜 3이 높음? 코드만 봐선 모름]
-        d.setStatus(0);                          // status(상태): 0 임시저장·1 상신·2 승인·3 반려·9 취소  [스멜3: 0=임시저장, DRAFT 대신 숫자 0]
-        d.setDrafterId(drafterId);
-        d.setApproverId(approverId);
-        d.setAmount(amount);
-        d.setCreatedAt(LocalDateTime.now());
-        d.setUpdatedAt(LocalDateTime.now());
-        repo.save(d);
+        Approval approval = new Approval();
+        approval.setTitle(title);
+        approval.setContent(content);
+        approval.setType(type);
+        approval.setPriority(urgent ? 3 : priority);   // priority(우선순위): 1 낮음·2 보통·3 높음  [스멜3: 3=높음, 왜 3이 높음? 코드만 봐선 모름]
+        approval.setStatus(ApprovalStatus.DRAFT);
+        approval.setDrafterId(drafterId);
+        approval.setApproverId(approverId);
+        approval.setAmount(amount);
+        approval.setCreatedAt(LocalDateTime.now());
+        approval.setUpdatedAt(LocalDateTime.now());
+        repo.save(approval);
 
         // [스멜4] 감사 로그 기록 — 이 6줄이 submit/approve/reject/cancel 에도 복붙 되어 있다.
         String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-        String line = "[" + now + "] APPROVAL CREATE id=" + d.getId()
-                + " by=" + drafterId + " type=" + d.getType();
+        String line = "[" + now + "] APPROVAL CREATE id=" + approval.getId()
+                + " by=" + drafterId + " type=" + approval.getType();
         audit.write(line);
-        return d;
+        return approval;
     }
 
     /**
@@ -73,87 +87,86 @@ public class ApprovalService {
      * action: 1=상신, 2=승인, 3=반려, 9=취소
      */
     public void processApproval(Long id, Long userId, int action, String reason) {
-        Approval d = repo.findById(id).orElse(null);   // d = 결재 문서(Approval 객체)
-        if (d == null) {
+        Approval approval = repo.findById(id).orElse(null);
+        if (approval == null) {
             // [스멜] 예외 대신 조용히 리턴 — 호출자는 실패를 알 수 없다.
             return;
         }
-        User u = userRepo.findById(userId).orElse(null);   // u = 사용자(User 객체)
-        if (u == null) {
+        User actor = userRepo.findById(userId).orElse(null);
+        if (actor == null) {
             return;
         }
 
-        int s = d.getStatus();     // s = status(상태): 0 임시저장·1 상신·2 승인·3 반려·9 취소  [스멜9: 한 글자라 의미 불명]
-        int proc = action;          // proc = action(처리 구분): 1 상신·2 승인·3 반려·9 취소  [스멜9: action 을 다른 약어로 또 담음, 의미 없음]
+        ApprovalStatus status = approval.getStatus();
 
         // [스멜2][스멜3] 거대한 if-지옥. 상태 전이 규칙이 숫자 비교로 흩어져 있다.
-        if (proc == 1) {            // proc==1 → 상신 (숫자 1을 외워야 의미를 앎)
-            // 상신: 임시저장(0)일 때만 가능
-            if (s == 0) {           // s==0 → 임시저장 상태일 때만
+        if (action == 1) {            // action==1 → 상신
+            // 상신: 임시저장일 때만 가능
+            if (status == ApprovalStatus.DRAFT) {
                 // [스멜6] 금액 기준 결재자 자동 상향 — 도메인 규칙이 서비스에 박혀 있다.
-                if (d.getType() == 1 && d.getAmount() >= 1000000) {   // type 1=지출·2=휴가·3=구매·4=기타 → type==1(지출) && 100만원↑
-                    d.setPriority(3);   // 3 = 높음
+                if (approval.getType() == 1 && approval.getAmount() >= 1000000) {   // type 1=지출·2=휴가·3=구매·4=기타 → type==1(지출) && 100만원↑
+                    approval.setPriority(3);   // 3 = 높음
                 }
-                d.setStatus(1);   // 1 = 상신 (SUBMITTED)
-                d.setUpdatedAt(LocalDateTime.now());
-                repo.save(d);
+                approval.setStatus(ApprovalStatus.SUBMITTED);
+                approval.setUpdatedAt(LocalDateTime.now());
+                repo.save(approval);
                 // [스멜4] 메일 발송 — 본문 생성 로직이 곳곳에 복붙.
-                User approver = userRepo.findById(d.getApproverId()).orElse(null);
+                User approver = userRepo.findById(approval.getApproverId()).orElse(null);
                 if (approver != null) {
                     String body = "안녕하세요 " + approver.getName() + "님,\n"
-                            + "결재 요청이 도착했습니다.\n제목: " + d.getTitle()
-                            + "\n기안자ID: " + d.getDrafterId();
-                    mail.send(approver.getEmail(), "[결재요청] " + d.getTitle(), body);
+                            + "결재 요청이 도착했습니다.\n제목: " + approval.getTitle()
+                            + "\n기안자ID: " + approval.getDrafterId();
+                    mail.send(approver.getEmail(), "[결재요청] " + approval.getTitle(), body);
                 }
-                writeAudit("APPROVAL SUBMIT", d.getId(), userId);
+                writeAudit("APPROVAL SUBMIT", approval.getId(), userId);
             }
-        } else if (proc == 2) {     // proc==2 → 승인
-            // 승인: 상신(1) 상태 + 본인이 결재자 + 권한(role>=2) 일 때만
-            if (s == 1) {           // s==1 → 상신 상태일 때만 승인 가능
-                if (d.getApproverId() != null && d.getApproverId().equals(userId)) {
-                    if (u.getRole() >= 2) {   // role 1=사원·2=팀장·3=임원 (role>=2 승인권한)  [스멜3: 숫자로 권한 판정]
-                        d.setStatus(2);        // 2 = 승인 (APPROVED)
-                        d.setUpdatedAt(LocalDateTime.now());
-                        repo.save(d);
+        } else if (action == 2) {     // action==2 → 승인
+            // 승인: 상신 상태 + 본인이 결재자 + 권한(role>=2) 일 때만
+            if (status == ApprovalStatus.SUBMITTED) {
+                if (approval.getApproverId() != null && approval.getApproverId().equals(userId)) {
+                    if (actor.getRole() >= 2) {   // role 1=사원·2=팀장·3=임원 (role>=2 승인권한)  [스멜3: 숫자로 권한 판정]
+                        approval.setStatus(ApprovalStatus.APPROVED);
+                        approval.setUpdatedAt(LocalDateTime.now());
+                        repo.save(approval);
                         // [스멜4] 또 복붙된 메일 발송
-                        User drafter = userRepo.findById(d.getDrafterId()).orElse(null);
+                        User drafter = userRepo.findById(approval.getDrafterId()).orElse(null);
                         if (drafter != null) {
                             String body = "안녕하세요 " + drafter.getName() + "님,\n"
-                                    + "결재가 승인되었습니다.\n제목: " + d.getTitle();
-                            mail.send(drafter.getEmail(), "[결재승인] " + d.getTitle(), body);
+                                    + "결재가 승인되었습니다.\n제목: " + approval.getTitle();
+                            mail.send(drafter.getEmail(), "[결재승인] " + approval.getTitle(), body);
                         }
-                        writeAudit("APPROVAL APPROVE", d.getId(), userId);
+                        writeAudit("APPROVAL APPROVE", approval.getId(), userId);
                     }
                 }
             }
-        } else if (proc == 3) {     // proc==3 → 반려
+        } else if (action == 3) {     // action==3 → 반려
             // 반려
-            if (s == 1) {           // s==1 → 상신 상태만 반려 가능
-                if (d.getApproverId() != null && d.getApproverId().equals(userId)) {
-                    if (u.getRole() >= 2) {   // role>=2 → 팀장 이상 (위 승인 분기와 똑같은 판정 복붙)
-                        d.setStatus(3);          // 3 = 반려 (REJECTED)
-                        d.setRejectReason(reason);
-                        d.setUpdatedAt(LocalDateTime.now());
-                        repo.save(d);
-                        User drafter = userRepo.findById(d.getDrafterId()).orElse(null);
+            if (status == ApprovalStatus.SUBMITTED) {
+                if (approval.getApproverId() != null && approval.getApproverId().equals(userId)) {
+                    if (actor.getRole() >= 2) {   // role>=2 → 팀장 이상 (위 승인 분기와 똑같은 판정 복붙)
+                        approval.setStatus(ApprovalStatus.REJECTED);
+                        approval.setRejectReason(reason);
+                        approval.setUpdatedAt(LocalDateTime.now());
+                        repo.save(approval);
+                        User drafter = userRepo.findById(approval.getDrafterId()).orElse(null);
                         if (drafter != null) {
                             String body = "안녕하세요 " + drafter.getName() + "님,\n"
-                                    + "결재가 반려되었습니다.\n제목: " + d.getTitle()
+                                    + "결재가 반려되었습니다.\n제목: " + approval.getTitle()
                                     + "\n사유: " + reason;
-                            mail.send(drafter.getEmail(), "[결재반려] " + d.getTitle(), body);
+                            mail.send(drafter.getEmail(), "[결재반려] " + approval.getTitle(), body);
                         }
-                        writeAudit("APPROVAL REJECT", d.getId(), userId);
+                        writeAudit("APPROVAL REJECT", approval.getId(), userId);
                     }
                 }
             }
-        } else if (proc == 9) {     // proc==9 → 취소 (왜 9? 4~8 은 비워둔 규칙 없는 번호)
-            // 취소: 기안자 본인 + 아직 승인 전(0 또는 1)
-            if (s == 0 || s == 1) {     // s==0(임시저장) 또는 s==1(상신)일 때만
-                if (d.getDrafterId() != null && d.getDrafterId().equals(userId)) {
-                    d.setStatus(9);   // 9 = 취소 (CANCELED)
-                    d.setUpdatedAt(LocalDateTime.now());
-                    repo.save(d);
-                    writeAudit("APPROVAL CANCEL", d.getId(), userId);
+        } else if (action == 9) {     // action==9 → 취소 (왜 9? 4~8 은 비워둔 규칙 없는 번호)
+            // 취소: 기안자 본인 + 아직 승인 전(임시저장 또는 상신)
+            if (status == ApprovalStatus.DRAFT || status == ApprovalStatus.SUBMITTED) {
+                if (approval.getDrafterId() != null && approval.getDrafterId().equals(userId)) {
+                    approval.setStatus(ApprovalStatus.CANCELED);
+                    approval.setUpdatedAt(LocalDateTime.now());
+                    repo.save(approval);
+                    writeAudit("APPROVAL CANCEL", approval.getId(), userId);
                 }
             }
         }
@@ -165,25 +178,17 @@ public class ApprovalService {
         audit.write("[" + now + "] " + act + " id=" + id + " by=" + userId);
     }
 
-    // [스멜1][스멜10] 화면 표시용 문자열까지 서비스가 만든다. 주석으로 매직넘버를 변명한다.
-    public String statusLabel(Approval d) {
-        int s = d.getStatus();   // s = status(상태): 0 임시저장·1 상신·2 승인·3 반려·9 취소
-        String tmp;          // tmp = 결과 라벨(반환할 상태 표시 문자열)  [스멜9: 임시? 의도가 안 드러남]
-        if (s == 0) tmp = "임시저장";       // status 0~9 를 라벨로 번역 — 이 표가 곳곳에 중복
-        else if (s == 1) tmp = "상신";
-        else if (s == 2) tmp = "승인";
-        else if (s == 3) tmp = "반려";
-        else if (s == 9) tmp = "취소";
-        else tmp = "알수없음";              // enum 이면 컴파일러가 막아줄 분기
-        return tmp;
+    // [리팩토링] 5분기 if-else + tmp 임시변수 제거 → ApprovalStatus.label()에 위임.
+    public String statusLabel(Approval approval) {
+        return approval.getStatus().label();
     }
 
     // [스멜6] Feature Envy — Approval 데이터를 꺼내 금액 등급을 서비스가 계산.
-    public String amountGrade(Approval d) {
-        long a = d.getAmount();   // a = amount(금액, 원)  [스멜9: 한 글자 약어]
-        if (a >= 10000000) return "S";   // [스멜3] 1000만원=S — 기준 숫자의 의미가 코드에 없음
-        else if (a >= 1000000) return "A";   // 100만원=A
-        else if (a >= 100000) return "B";    // 10만원=B
+    public String amountGrade(Approval approval) {
+        long amount = approval.getAmount();
+        if (amount >= 10000000) return "S";   // [스멜3] 1000만원=S — 기준 숫자의 의미가 코드에 없음
+        else if (amount >= 1000000) return "A";   // 100만원=A
+        else if (amount >= 100000) return "B";    // 10만원=B
         else return "C";
     }
 
