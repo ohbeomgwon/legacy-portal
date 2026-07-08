@@ -52,6 +52,15 @@ import java.util.List;
  * [리팩토링] action 코드 enum을 ApprovalService의 private 중첩 타입에서 {@link ApprovalStatus}
  *            안의 중첩 enum({@code ApprovalStatus.Action})으로 이동 — 결재의 "상태"와 "상태 전이
  *            명령"이 서로 다른 클래스에 흩어져 있던 것을 한 곳(ApprovalStatus)에 모았다.
+ * [리팩토링] 스멜2(Long Method) 해소 — processApproval()의 6단계 중첩 if-지옥을 걷어냈다
+ *            (기법: Extract Method + Replace Nested Conditional with Guard Clauses).
+ *              - processApproval()은 이제 공통 전제조건(대상·사용자 조회) 확인 후
+ *                action에 따라 submit/approve/reject/cancel 중 하나로 위임만 한다.
+ *              - 각 private 메서드 내부의 전제조건(상태·결재자/기안자 본인 확인·권한)은 중첩 if
+ *                대신 가드 클로즈(guard clause)로 조기 반환하도록 바꿔, 각 메서드의 중첩 깊이가
+ *                1단계로 줄었다(원래 승인/반려 분기의 최대 깊이 6단계 → 1단계).
+ *              - public 시그니처 processApproval(id, userId, action, reason)과 관찰 가능한 동작
+ *                (상태 전이 결과·메일 발송·감사 로그·조용한 무시)은 전혀 바뀌지 않았다.
  * 위 변경 전후로 refactor/start 특성화 테스트 6개가 green 유지됨을 확인했다.
  */
 @Service
@@ -107,8 +116,8 @@ public class ApprovalService {
     private static final int MIN_ROLE_CODE_FOR_APPROVAL = 2;
 
     /**
-     * 결재 처리 — 상신/승인/반려/취소를 action 코드로 분기한다.
-     * [스멜2] 이 메서드 하나가 모든 일을 한다. [스멜1][스멜6] 규칙 계산을 서비스가 떠안는다.
+     * 결재 처리 — 상신/승인/반려/취소를 action 코드로 분기해 각 처리 메서드에 위임한다.
+     * [스멜1][스멜6] 상태 전이 규칙 계산 자체는 여전히 서비스가 떠안는다(God Class는 별도 과제).
      *
      * action: 1=상신, 2=승인, 3=반려, 9=취소
      */
@@ -123,81 +132,108 @@ public class ApprovalService {
             return;
         }
 
-        ApprovalStatus status = approval.getStatus();
         ApprovalStatus.Action requestedAction = ApprovalStatus.Action.fromCode(action);
-
-        // [스멜2] 거대한 if-지옥. 상태 전이 규칙 자체는 여전히 서비스에 흩어져 있다(Long Method는 별도 과제).
         if (requestedAction == ApprovalStatus.Action.SUBMIT) {
-            // 상신: 임시저장일 때만 가능
-            if (status == ApprovalStatus.DRAFT) {
-                // [스멜6] 금액 기준 결재자 자동 상향 — 도메인 규칙이 서비스에 박혀 있다.
-                if (approval.getType() == EXPENSE_TYPE_CODE
-                        && approval.getAmount() >= AUTO_PRIORITY_UPGRADE_AMOUNT_THRESHOLD) {
-                    approval.setPriority(HIGH_PRIORITY_CODE);
-                }
-                approval.setStatus(ApprovalStatus.SUBMITTED);
-                approval.setUpdatedAt(LocalDateTime.now());
-                repo.save(approval);
-                // [스멜4] 메일 발송 — 본문 생성 로직이 곳곳에 복붙.
-                User approver = userRepo.findById(approval.getApproverId()).orElse(null);
-                if (approver != null) {
-                    String body = "안녕하세요 " + approver.getName() + "님,\n"
-                            + "결재 요청이 도착했습니다.\n제목: " + approval.getTitle()
-                            + "\n기안자ID: " + approval.getDrafterId();
-                    mail.send(approver.getEmail(), "[결재요청] " + approval.getTitle(), body);
-                }
-                writeAudit("APPROVAL SUBMIT", approval.getId(), userId);
-            }
+            submit(approval, actor);
         } else if (requestedAction == ApprovalStatus.Action.APPROVE) {
-            // 승인: 상신 상태 + 본인이 결재자 + 권한(팀장 이상) 일 때만
-            if (status == ApprovalStatus.SUBMITTED) {
-                if (approval.getApproverId() != null && approval.getApproverId().equals(userId)) {
-                    if (actor.getRole() >= MIN_ROLE_CODE_FOR_APPROVAL) {
-                        approval.setStatus(ApprovalStatus.APPROVED);
-                        approval.setUpdatedAt(LocalDateTime.now());
-                        repo.save(approval);
-                        // [스멜4] 또 복붙된 메일 발송
-                        User drafter = userRepo.findById(approval.getDrafterId()).orElse(null);
-                        if (drafter != null) {
-                            String body = "안녕하세요 " + drafter.getName() + "님,\n"
-                                    + "결재가 승인되었습니다.\n제목: " + approval.getTitle();
-                            mail.send(drafter.getEmail(), "[결재승인] " + approval.getTitle(), body);
-                        }
-                        writeAudit("APPROVAL APPROVE", approval.getId(), userId);
-                    }
-                }
-            }
+            approve(approval, actor);
         } else if (requestedAction == ApprovalStatus.Action.REJECT) {
-            // 반려
-            if (status == ApprovalStatus.SUBMITTED) {
-                if (approval.getApproverId() != null && approval.getApproverId().equals(userId)) {
-                    if (actor.getRole() >= MIN_ROLE_CODE_FOR_APPROVAL) {
-                        approval.setStatus(ApprovalStatus.REJECTED);
-                        approval.setRejectReason(reason);
-                        approval.setUpdatedAt(LocalDateTime.now());
-                        repo.save(approval);
-                        User drafter = userRepo.findById(approval.getDrafterId()).orElse(null);
-                        if (drafter != null) {
-                            String body = "안녕하세요 " + drafter.getName() + "님,\n"
-                                    + "결재가 반려되었습니다.\n제목: " + approval.getTitle()
-                                    + "\n사유: " + reason;
-                            mail.send(drafter.getEmail(), "[결재반려] " + approval.getTitle(), body);
-                        }
-                        writeAudit("APPROVAL REJECT", approval.getId(), userId);
-                    }
-                }
-            }
+            reject(approval, actor, reason);
         } else if (requestedAction == ApprovalStatus.Action.CANCEL) {
-            // 취소: 기안자 본인 + 아직 승인 전(임시저장 또는 상신)
-            if (status == ApprovalStatus.DRAFT || status == ApprovalStatus.SUBMITTED) {
-                if (approval.getDrafterId() != null && approval.getDrafterId().equals(userId)) {
-                    approval.setStatus(ApprovalStatus.CANCELED);
-                    approval.setUpdatedAt(LocalDateTime.now());
-                    repo.save(approval);
-                    writeAudit("APPROVAL CANCEL", approval.getId(), userId);
-                }
-            }
+            cancel(approval, actor);
         }
+        // requestedAction이 null(정의되지 않은 action 값)이면 아무 분기와도 매칭되지 않아
+        // 조용히 무시된다 — 레거시 동작 보존.
+    }
+
+    // 상신: 임시저장 상태일 때만 가능(기안자 본인 확인은 레거시에도 없다 — 동작 보존).
+    private void submit(Approval approval, User actor) {
+        if (approval.getStatus() != ApprovalStatus.DRAFT) {
+            return;
+        }
+        // [스멜6] 금액 기준 결재자 자동 상향 — 도메인 규칙이 서비스에 박혀 있다.
+        if (approval.getType() == EXPENSE_TYPE_CODE
+                && approval.getAmount() >= AUTO_PRIORITY_UPGRADE_AMOUNT_THRESHOLD) {
+            approval.setPriority(HIGH_PRIORITY_CODE);
+        }
+        approval.setStatus(ApprovalStatus.SUBMITTED);
+        approval.setUpdatedAt(LocalDateTime.now());
+        repo.save(approval);
+
+        // [스멜4] 메일 발송 — 본문 생성 로직이 곳곳에 복붙.
+        User approver = userRepo.findById(approval.getApproverId()).orElse(null);
+        if (approver != null) {
+            String body = "안녕하세요 " + approver.getName() + "님,\n"
+                    + "결재 요청이 도착했습니다.\n제목: " + approval.getTitle()
+                    + "\n기안자ID: " + approval.getDrafterId();
+            mail.send(approver.getEmail(), "[결재요청] " + approval.getTitle(), body);
+        }
+        writeAudit("APPROVAL SUBMIT", approval.getId(), actor.getId());
+    }
+
+    // 승인: 상신 상태 + 본인이 결재자 + 권한(팀장 이상) 일 때만.
+    private void approve(Approval approval, User actor) {
+        if (approval.getStatus() != ApprovalStatus.SUBMITTED) {
+            return;
+        }
+        if (approval.getApproverId() == null || !approval.getApproverId().equals(actor.getId())) {
+            return;
+        }
+        if (actor.getRole() < MIN_ROLE_CODE_FOR_APPROVAL) {   // role 1=사원·2=팀장·3=임원 (role>=2 승인권한)
+            return;
+        }
+        approval.setStatus(ApprovalStatus.APPROVED);
+        approval.setUpdatedAt(LocalDateTime.now());
+        repo.save(approval);
+
+        // [스멜4] 또 복붙된 메일 발송
+        User drafter = userRepo.findById(approval.getDrafterId()).orElse(null);
+        if (drafter != null) {
+            String body = "안녕하세요 " + drafter.getName() + "님,\n"
+                    + "결재가 승인되었습니다.\n제목: " + approval.getTitle();
+            mail.send(drafter.getEmail(), "[결재승인] " + approval.getTitle(), body);
+        }
+        writeAudit("APPROVAL APPROVE", approval.getId(), actor.getId());
+    }
+
+    // 반려: 승인과 전제조건이 완전히 동일하다(상신 상태 + 본인이 결재자 + 권한).
+    private void reject(Approval approval, User actor, String reason) {
+        if (approval.getStatus() != ApprovalStatus.SUBMITTED) {
+            return;
+        }
+        if (approval.getApproverId() == null || !approval.getApproverId().equals(actor.getId())) {
+            return;
+        }
+        if (actor.getRole() < MIN_ROLE_CODE_FOR_APPROVAL) {   // role>=2 → 팀장 이상 (위 승인과 똑같은 판정 복붙)
+            return;
+        }
+        approval.setStatus(ApprovalStatus.REJECTED);
+        approval.setRejectReason(reason);
+        approval.setUpdatedAt(LocalDateTime.now());
+        repo.save(approval);
+
+        User drafter = userRepo.findById(approval.getDrafterId()).orElse(null);
+        if (drafter != null) {
+            String body = "안녕하세요 " + drafter.getName() + "님,\n"
+                    + "결재가 반려되었습니다.\n제목: " + approval.getTitle()
+                    + "\n사유: " + reason;
+            mail.send(drafter.getEmail(), "[결재반려] " + approval.getTitle(), body);
+        }
+        writeAudit("APPROVAL REJECT", approval.getId(), actor.getId());
+    }
+
+    // 취소: 기안자 본인 + 아직 승인 전(임시저장 또는 상신)일 때만. 승인 권한(role)은 확인하지 않는다.
+    private void cancel(Approval approval, User actor) {
+        if (approval.getStatus() != ApprovalStatus.DRAFT && approval.getStatus() != ApprovalStatus.SUBMITTED) {
+            return;
+        }
+        if (approval.getDrafterId() == null || !approval.getDrafterId().equals(actor.getId())) {
+            return;
+        }
+        approval.setStatus(ApprovalStatus.CANCELED);
+        approval.setUpdatedAt(LocalDateTime.now());
+        repo.save(approval);
+        writeAudit("APPROVAL CANCEL", approval.getId(), actor.getId());
     }
 
     // [스멜4] 그나마 추출했지만 create() 안에는 또 복붙이 남아 있다(불완전한 중복 제거).
