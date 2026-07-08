@@ -39,6 +39,19 @@ import java.util.List;
  *            Replace Conditional with Polymorphism의 단순화 버전). 상태값은 이제 enum이
  *            보장하므로 레거시의 "알수없음" 폴백 분기는 도달 불가능해져 자연히 사라진다
  *            (setStatus가 ApprovalStatus 타입만 받으므로 정의되지 않은 상태값 자체가 만들어질 수 없음).
+ * [리팩토링] processApproval()에 남아있던 매직넘버 전부 제거(기법: Replace Magic Number with
+ *            Symbolic Constant).
+ *              - action 코드(1/2/3/9)는 {@link ApprovalStatus.Action} enum으로 매핑해 비교한다.
+ *                processApproval의 public 시그니처(int action)는 CLAUDE.md 계약 보존 규칙에 따라
+ *                그대로 유지하고, 메서드 진입 시에만 enum으로 변환한다. 정의되지 않은 action 값은
+ *                fromCode()가 null을 반환해 어떤 분기와도 매칭되지 않으므로 "조용히 무시"하는
+ *                레거시 동작이 그대로 보존된다.
+ *              - type(지출)·금액 임계값·우선순위(높음)·결재 권한 최소 역할은 이름 있는 상수로 추출했다.
+ *                이 값들은 Approval.type/priority, User.role 필드 자체를 enum으로 바꾸는 것과는
+ *                다른, 더 작은 범위의 변경이다(필드 타입은 이번 범위 밖이라 아직 int 그대로).
+ * [리팩토링] action 코드 enum을 ApprovalService의 private 중첩 타입에서 {@link ApprovalStatus}
+ *            안의 중첩 enum({@code ApprovalStatus.Action})으로 이동 — 결재의 "상태"와 "상태 전이
+ *            명령"이 서로 다른 클래스에 흩어져 있던 것을 한 곳(ApprovalStatus)에 모았다.
  * 위 변경 전후로 refactor/start 특성화 테스트 6개가 green 유지됨을 확인했다.
  */
 @Service
@@ -80,6 +93,19 @@ public class ApprovalService {
         return approval;
     }
 
+    // [매직넘버 제거] Approval.type 코드 중 "지출"만 processApproval에서 참조하므로 이 상수로 대체.
+    // type 필드 자체(1~4 전체)를 enum으로 바꾸는 것은 이번 범위 밖이다.
+    private static final int EXPENSE_TYPE_CODE = 1;
+
+    // [매직넘버 제거] 지출 결재가 이 금액(원) 이상이면 상신 시 우선순위를 자동으로 높인다.
+    private static final long AUTO_PRIORITY_UPGRADE_AMOUNT_THRESHOLD = 1_000_000L;
+
+    // [매직넘버 제거] Approval.priority 코드 중 "높음"만 이 메서드에서 참조하므로 이 상수로 대체.
+    private static final int HIGH_PRIORITY_CODE = 3;
+
+    // [매직넘버 제거] User.role 코드 중 승인/반려 권한 최소 기준("팀장 이상")만 참조하므로 이 상수로 대체.
+    private static final int MIN_ROLE_CODE_FOR_APPROVAL = 2;
+
     /**
      * 결재 처리 — 상신/승인/반려/취소를 action 코드로 분기한다.
      * [스멜2] 이 메서드 하나가 모든 일을 한다. [스멜1][스멜6] 규칙 계산을 서비스가 떠안는다.
@@ -98,14 +124,16 @@ public class ApprovalService {
         }
 
         ApprovalStatus status = approval.getStatus();
+        ApprovalStatus.Action requestedAction = ApprovalStatus.Action.fromCode(action);
 
-        // [스멜2][스멜3] 거대한 if-지옥. 상태 전이 규칙이 숫자 비교로 흩어져 있다.
-        if (action == 1) {            // action==1 → 상신
+        // [스멜2] 거대한 if-지옥. 상태 전이 규칙 자체는 여전히 서비스에 흩어져 있다(Long Method는 별도 과제).
+        if (requestedAction == ApprovalStatus.Action.SUBMIT) {
             // 상신: 임시저장일 때만 가능
             if (status == ApprovalStatus.DRAFT) {
                 // [스멜6] 금액 기준 결재자 자동 상향 — 도메인 규칙이 서비스에 박혀 있다.
-                if (approval.getType() == 1 && approval.getAmount() >= 1000000) {   // type 1=지출·2=휴가·3=구매·4=기타 → type==1(지출) && 100만원↑
-                    approval.setPriority(3);   // 3 = 높음
+                if (approval.getType() == EXPENSE_TYPE_CODE
+                        && approval.getAmount() >= AUTO_PRIORITY_UPGRADE_AMOUNT_THRESHOLD) {
+                    approval.setPriority(HIGH_PRIORITY_CODE);
                 }
                 approval.setStatus(ApprovalStatus.SUBMITTED);
                 approval.setUpdatedAt(LocalDateTime.now());
@@ -120,11 +148,11 @@ public class ApprovalService {
                 }
                 writeAudit("APPROVAL SUBMIT", approval.getId(), userId);
             }
-        } else if (action == 2) {     // action==2 → 승인
-            // 승인: 상신 상태 + 본인이 결재자 + 권한(role>=2) 일 때만
+        } else if (requestedAction == ApprovalStatus.Action.APPROVE) {
+            // 승인: 상신 상태 + 본인이 결재자 + 권한(팀장 이상) 일 때만
             if (status == ApprovalStatus.SUBMITTED) {
                 if (approval.getApproverId() != null && approval.getApproverId().equals(userId)) {
-                    if (actor.getRole() >= 2) {   // role 1=사원·2=팀장·3=임원 (role>=2 승인권한)  [스멜3: 숫자로 권한 판정]
+                    if (actor.getRole() >= MIN_ROLE_CODE_FOR_APPROVAL) {
                         approval.setStatus(ApprovalStatus.APPROVED);
                         approval.setUpdatedAt(LocalDateTime.now());
                         repo.save(approval);
@@ -139,11 +167,11 @@ public class ApprovalService {
                     }
                 }
             }
-        } else if (action == 3) {     // action==3 → 반려
+        } else if (requestedAction == ApprovalStatus.Action.REJECT) {
             // 반려
             if (status == ApprovalStatus.SUBMITTED) {
                 if (approval.getApproverId() != null && approval.getApproverId().equals(userId)) {
-                    if (actor.getRole() >= 2) {   // role>=2 → 팀장 이상 (위 승인 분기와 똑같은 판정 복붙)
+                    if (actor.getRole() >= MIN_ROLE_CODE_FOR_APPROVAL) {
                         approval.setStatus(ApprovalStatus.REJECTED);
                         approval.setRejectReason(reason);
                         approval.setUpdatedAt(LocalDateTime.now());
@@ -159,7 +187,7 @@ public class ApprovalService {
                     }
                 }
             }
-        } else if (action == 9) {     // action==9 → 취소 (왜 9? 4~8 은 비워둔 규칙 없는 번호)
+        } else if (requestedAction == ApprovalStatus.Action.CANCEL) {
             // 취소: 기안자 본인 + 아직 승인 전(임시저장 또는 상신)
             if (status == ApprovalStatus.DRAFT || status == ApprovalStatus.SUBMITTED) {
                 if (approval.getDrafterId() != null && approval.getDrafterId().equals(userId)) {

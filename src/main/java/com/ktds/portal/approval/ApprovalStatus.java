@@ -46,4 +46,33 @@ public enum ApprovalStatus {
         }
         throw new IllegalArgumentException("Unknown ApprovalStatus code: " + code);
     }
+
+    /**
+     * [리팩토링] ApprovalService에 private 중첩 enum으로 흩어져 있던 action 코드(1/2/3/9)를
+     * 상태(ApprovalStatus)와 한 클래스에 모았다 — 둘 다 결재 하나의 "상태·상태 전이 명령"이라는
+     * 같은 개념 축에 속하기 때문이다. DB에 저장되지 않는 값이라 컨버터는 없다.
+     *
+     * processApproval()의 public 시그니처(int action)는 CLAUDE.md 계약 보존 규칙에 따라 그대로
+     * 유지하고, 메서드 안에서만 이 enum으로 변환해 비교한다. fromCode()가 정의되지 않은 값에
+     * null을 반환하면 이후 어떤 분기와도 매칭되지 않으므로, 레거시의 "정의되지 않은 action은
+     * 조용히 무시" 동작이 그대로 보존된다.
+     */
+    public enum Action {
+        SUBMIT(1), APPROVE(2), REJECT(3), CANCEL(9);
+
+        private final int code;
+
+        Action(int code) {
+            this.code = code;
+        }
+
+        public static Action fromCode(int code) {
+            for (Action action : values()) {
+                if (action.code == code) {
+                    return action;
+                }
+            }
+            return null;
+        }
+    }
 }
