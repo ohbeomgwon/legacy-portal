@@ -1,12 +1,11 @@
 package com.ktds.portal.schedule;
 
-import com.ktds.portal.common.FileAuditLogger;
+import com.ktds.portal.common.ConsoleAuditLogger;
 import com.ktds.portal.user.User;
 import com.ktds.portal.user.UserRepository;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 
 /**
  * 일정 서비스.
@@ -17,7 +16,7 @@ public class ScheduleService {
 
     private final ScheduleRepository repo;
     private final UserRepository userRepo;
-    private final FileAuditLogger audit = new FileAuditLogger();
+    private final ConsoleAuditLogger audit = new ConsoleAuditLogger();
 
     public ScheduleService(ScheduleRepository repo, UserRepository userRepo) {
         this.repo = repo;
@@ -58,9 +57,8 @@ public class ScheduleService {
         sc.setStatus(0);   // status(상태): 0 예정·1 확정·9 취소  [0=예정, 확정 전]
         repo.save(sc);
 
-        // [스멜4] 또 복붙된 감사 로그.
-        String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-        audit.write("[" + now + "] SCHEDULE CREATE id=" + sc.getId() + " by=" + ownerId);
+        // [리팩토링] 감사 로그 조립을 AuditLogger 구현체로 위임(ApprovalService와 동일한 계약).
+        audit.write("SCHEDULE CREATE", sc.getId(), ownerId);
         return sc;
     }
 
@@ -73,8 +71,7 @@ public class ScheduleService {
             if (sc.getStatus() == 0) {          // status==0 → 예정 상태일 때만
                 sc.setStatus(1);   // 1 = 확정 (CONFIRMED)
                 repo.save(sc);
-                String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-                audit.write("[" + now + "] SCHEDULE CONFIRM id=" + sc.getId() + " by=" + userId);
+                audit.write("SCHEDULE CONFIRM", sc.getId(), userId);
             }
         }
     }

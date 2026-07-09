@@ -1,13 +1,12 @@
 package com.ktds.portal.notice;
 
-import com.ktds.portal.common.FileAuditLogger;
-import com.ktds.portal.common.SmtpMailSender;
+import com.ktds.portal.common.ConsoleAuditLogger;
+import com.ktds.portal.common.ConsoleMailSender;
 import com.ktds.portal.user.User;
 import com.ktds.portal.user.UserRepository;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 
 /**
  * 공지 서비스.
@@ -21,8 +20,8 @@ public class NoticeService {
     private final NoticeRepository repo;
     private final UserRepository userRepo;
 
-    private final SmtpMailSender mail = new SmtpMailSender();
-    private final FileAuditLogger audit = new FileAuditLogger();
+    private final ConsoleMailSender mail = new ConsoleMailSender();
+    private final ConsoleAuditLogger audit = new ConsoleAuditLogger();
 
     public NoticeService(NoticeRepository repo, UserRepository userRepo) {
         this.repo = repo;
@@ -40,9 +39,8 @@ public class NoticeService {
         n.setCreatedAt(LocalDateTime.now());
         repo.save(n);
 
-        // [스멜4] ApprovalService.create() 와 사실상 동일한 감사 로그 코드(복붙).
-        String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-        audit.write("[" + now + "] NOTICE CREATE id=" + n.getId() + " by=" + writerId);
+        // [리팩토링] 감사 로그 조립을 AuditLogger 구현체로 위임(ApprovalService와 동일한 계약).
+        audit.write("NOTICE CREATE", n.getId(), writerId);
         return n;
     }
 
@@ -66,8 +64,7 @@ public class NoticeService {
                         mail.send(member.getEmail(), "[긴급공지] " + n.getTitle(), body);
                     }
                 }
-                String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-                audit.write("[" + now + "] NOTICE PUBLISH id=" + n.getId() + " by=" + userId);
+                audit.write("NOTICE PUBLISH", n.getId(), userId);
             }
         }
     }

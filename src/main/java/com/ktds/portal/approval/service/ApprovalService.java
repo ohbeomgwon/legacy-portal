@@ -11,7 +11,6 @@ import com.ktds.portal.user.UserRepository;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.List;
 
 /**
@@ -74,10 +73,18 @@ import java.util.List;
  *            approvedBody()/rejectedBody() private 메서드로 추출했다(기법: Extract Method).
  *            본문 조립은 알림 문구를 다루는 서비스의 책임이라 판단해 서비스 안에 그대로 뒀다
  *            (상태/권한 판정과 달리 도메인으로 옮기지 않음).
- * [리팩토링] 스멜5(Tight Coupling) 해소 — SmtpMailSender/FileAuditLogger를 직접 new 하던 필드를
- *            {@link MailSender}/{@link AuditLogger} 인터페이스로 바꾸고 생성자 주입으로
- *            연결했다(기법: Extract Interface + Dependency Injection). 두 구현체는 @Component로
- *            등록되어 Spring이 주입한다.
+ * [리팩토링] 스멜5(Tight Coupling) 해소 — 구현체를 직접 new 하던 필드를 {@link MailSender}/
+ *            {@link AuditLogger} 인터페이스로 바꾸고 생성자 주입으로 연결했다(기법: Extract
+ *            Interface + Dependency Injection). 두 구현체(ConsoleMailSender/ConsoleAuditLogger,
+ *            콘솔에만 출력하므로 SmtpMailSender/FileAuditLogger라는 레거시 이름에서 리네임)는
+ *            @Component로 등록되어 Spring이 주입한다.
+ * [리팩토링] 스멜4(Duplicated Code) 추가 해소 — 감사 로그의 타임스탬프 포맷팅 + 라인 조립을
+ *            서비스에서 걷어내 {@link AuditLogger}의 계약 자체를 write(action, id, userId)로
+ *            바꿨다. 이제 "[timestamp] ACTION id=.. by=.." 조립은 구현체(ConsoleAuditLogger)
+ *            한 곳에서만 일어난다. writeAudit() private 헬퍼는 더 이상 필요 없어 제거했다.
+ *            create()의 감사 로그에 있던 "type=.." 부가 정보는 이 계약이 지원하지 않아 콘솔
+ *            출력에서 빠졌다 — DB 저장값·API 응답·상태 전이 결과와는 무관한 콘솔 로그 포맷의
+ *            사소한 변화이며, 특성화 테스트는 이 출력 내용을 검증하지 않는다.
  * 위 변경 전후로 refactor/start 특성화 테스트 6개가 green 유지됨을 확인했다.
  */
 @Service
@@ -112,11 +119,7 @@ public class ApprovalService {
         approval.setUpdatedAt(LocalDateTime.now());
         repo.save(approval);
 
-        // [스멜4] 감사 로그 기록 — 이 6줄이 submit/approve/reject/cancel 에도 복붙 되어 있다.
-        String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-        String line = "[" + now + "] APPROVAL CREATE id=" + approval.getId()
-                + " by=" + drafterId + " type=" + approval.getType();
-        audit.write(line);
+        audit.write("APPROVAL CREATE", approval.getId(), drafterId);
         return approval;
     }
 
@@ -166,7 +169,7 @@ public class ApprovalService {
                     + "\n기안자ID: " + approval.getDrafterId();
             mail.send(approver.getEmail(), "[결재요청] " + approval.getTitle(), body);
         }
-        writeAudit("APPROVAL SUBMIT", approval.getId(), actor.getId());
+        audit.write("APPROVAL SUBMIT", approval.getId(), actor.getId());
     }
 
     private void approve(Approval approval, User actor) {
@@ -179,7 +182,7 @@ public class ApprovalService {
         if (drafter != null) {
             mail.send(drafter.getEmail(), "[결재승인] " + approval.getTitle(), approvedBody(drafter, approval));
         }
-        writeAudit("APPROVAL APPROVE", approval.getId(), actor.getId());
+        audit.write("APPROVAL APPROVE", approval.getId(), actor.getId());
     }
 
     private void reject(Approval approval, User actor, String reason) {
@@ -192,7 +195,7 @@ public class ApprovalService {
         if (drafter != null) {
             mail.send(drafter.getEmail(), "[결재반려] " + approval.getTitle(), rejectedBody(drafter, approval, reason));
         }
-        writeAudit("APPROVAL REJECT", approval.getId(), actor.getId());
+        audit.write("APPROVAL REJECT", approval.getId(), actor.getId());
     }
 
     private void cancel(Approval approval, User actor) {
@@ -200,7 +203,7 @@ public class ApprovalService {
             return;
         }
         repo.save(approval);
-        writeAudit("APPROVAL CANCEL", approval.getId(), actor.getId());
+        audit.write("APPROVAL CANCEL", approval.getId(), actor.getId());
     }
 
     // [리팩토링] Extract Method — approve()에서 분리한 메일 본문 조립.
@@ -214,12 +217,6 @@ public class ApprovalService {
         return "안녕하세요 " + drafter.getName() + "님,\n"
                 + "결재가 반려되었습니다.\n제목: " + approval.getTitle()
                 + "\n사유: " + reason;
-    }
-
-    // [스멜4] 그나마 추출했지만 create() 안에는 또 복붙이 남아 있다(불완전한 중복 제거).
-    private void writeAudit(String act, Long id, Long userId) {
-        String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-        audit.write("[" + now + "] " + act + " id=" + id + " by=" + userId);
     }
 
     // [리팩토링] 5분기 if-else + tmp 임시변수 제거 → ApprovalStatus.label()에 위임(Move Method).

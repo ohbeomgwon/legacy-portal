@@ -4,8 +4,8 @@ import com.ktds.portal.approval.domain.Approval;
 import com.ktds.portal.approval.domain.ApprovalStatus;
 import com.ktds.portal.approval.repository.ApprovalRepository;
 import com.ktds.portal.approval.service.ApprovalService;
-import com.ktds.portal.common.FileAuditLogger;
-import com.ktds.portal.common.SmtpMailSender;
+import com.ktds.portal.common.ConsoleAuditLogger;
+import com.ktds.portal.common.ConsoleMailSender;
 import com.ktds.portal.user.User;
 import com.ktds.portal.user.UserRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -31,7 +31,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
  * 올리고 @Autowired 로만 주입받는다(직접 new 금지).
  */
 @DataJpaTest
-@Import({ApprovalService.class, SmtpMailSender.class, FileAuditLogger.class})
+@Import({ApprovalService.class, ConsoleMailSender.class, ConsoleAuditLogger.class})
 class ApprovalServiceProcessApprovalCharacterizationTest {
 
     @Autowired
