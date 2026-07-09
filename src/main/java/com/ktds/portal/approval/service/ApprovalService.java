@@ -1,10 +1,11 @@
 package com.ktds.portal.approval.service;
 
+import com.ktds.portal.approval.domain.AmountGrade;
 import com.ktds.portal.approval.domain.Approval;
 import com.ktds.portal.approval.domain.ApprovalStatus;
 import com.ktds.portal.approval.repository.ApprovalRepository;
-import com.ktds.portal.common.FileAuditLogger;
-import com.ktds.portal.common.SmtpMailSender;
+import com.ktds.portal.common.AuditLogger;
+import com.ktds.portal.common.MailSender;
 import com.ktds.portal.user.User;
 import com.ktds.portal.user.UserRepository;
 import org.springframework.stereotype.Service;
@@ -50,8 +51,6 @@ import java.util.List;
  *                fromCode()가 null을 반환해 어떤 분기와도 매칭되지 않으므로 "조용히 무시"하는
  *                레거시 동작이 그대로 보존된다.
  *              - type(지출)·금액 임계값·우선순위(높음)·결재 권한 최소 역할은 이름 있는 상수로 추출했다.
- *                이 값들은 Approval.type/priority, User.role 필드 자체를 enum으로 바꾸는 것과는
- *                다른, 더 작은 범위의 변경이다(필드 타입은 이번 범위 밖이라 아직 int 그대로).
  * [리팩토링] action 코드 enum을 ApprovalService의 private 중첩 타입에서 {@link ApprovalStatus}
  *            안의 중첩 enum({@code ApprovalStatus.Action})으로 이동 — 결재의 "상태"와 "상태 전이
  *            명령"이 서로 다른 클래스에 흩어져 있던 것을 한 곳(ApprovalStatus)에 모았다.
@@ -59,11 +58,26 @@ import java.util.List;
  *            (기법: Extract Method + Replace Nested Conditional with Guard Clauses).
  *              - processApproval()은 이제 공통 전제조건(대상·사용자 조회) 확인 후
  *                action에 따라 submit/approve/reject/cancel 중 하나로 위임만 한다.
- *              - 각 private 메서드 내부의 전제조건(상태·결재자/기안자 본인 확인·권한)은 중첩 if
- *                대신 가드 클로즈(guard clause)로 조기 반환하도록 바꿔, 각 메서드의 중첩 깊이가
- *                1단계로 줄었다(원래 승인/반려 분기의 최대 깊이 6단계 → 1단계).
  *              - public 시그니처 processApproval(id, userId, action, reason)과 관찰 가능한 동작
  *                (상태 전이 결과·메일 발송·감사 로그·조용한 무시)은 전혀 바뀌지 않았다.
+ * [리팩토링] statusLabel·amountGrade는 표현/도메인 규칙이지 서비스의 책임이 아니라고 판단해
+ *            Move Method로 이동했다 — statusLabel()은 ApprovalStatus.label(), amountGrade()는
+ *            {@link AmountGrade} enum에 위임한다. 두 메서드의 public 시그니처와 반환값은 그대로다.
+ * [리팩토링] 스멜1·6·7(God Class의 상태전이/권한 규칙 + Feature Envy + Primitive Obsession) 해소
+ *            — submit/approve/reject/cancel의 가드 클로즈(상태·본인확인·권한 판정)와 상신 시
+ *            우선순위 자동 상향 규칙을 {@link Approval} 엔티티의 도메인 메서드로 이동했다(기법:
+ *            Move Method — Anemic Domain Model 해소). 레거시는 규칙 위반 시 예외 없이 조용히
+ *            무시했으므로, Approval의 각 메서드도 예외 대신 boolean(성공 여부)을 반환한다.
+ *            서비스는 이제 "도메인 메서드 호출 → 성공 시에만 저장·메일·감사로그"라는 오케스트레이션만
+ *            담당하고, 상태·권한 판정 로직 자체는 갖고 있지 않다.
+ * [리팩토링] 스멜4(Duplicated Code) 일부 해소 — approve()/reject()의 메일 본문 조립을
+ *            approvedBody()/rejectedBody() private 메서드로 추출했다(기법: Extract Method).
+ *            본문 조립은 알림 문구를 다루는 서비스의 책임이라 판단해 서비스 안에 그대로 뒀다
+ *            (상태/권한 판정과 달리 도메인으로 옮기지 않음).
+ * [리팩토링] 스멜5(Tight Coupling) 해소 — SmtpMailSender/FileAuditLogger를 직접 new 하던 필드를
+ *            {@link MailSender}/{@link AuditLogger} 인터페이스로 바꾸고 생성자 주입으로
+ *            연결했다(기법: Extract Interface + Dependency Injection). 두 구현체는 @Component로
+ *            등록되어 Spring이 주입한다.
  * 위 변경 전후로 refactor/start 특성화 테스트 6개가 green 유지됨을 확인했다.
  */
 @Service
@@ -71,14 +85,15 @@ public class ApprovalService {
 
     private final ApprovalRepository repo;
     private final UserRepository userRepo;
+    private final MailSender mail;
+    private final AuditLogger audit;
 
-    // [스멜5] 강결합 — 협력 객체를 생성자 주입 없이 직접 new 한다. 테스트에서 갈아끼울 수 없다.
-    private final SmtpMailSender mail = new SmtpMailSender();
-    private final FileAuditLogger audit = new FileAuditLogger();
-
-    public ApprovalService(ApprovalRepository repo, UserRepository userRepo) {
+    public ApprovalService(ApprovalRepository repo, UserRepository userRepo,
+                            MailSender mail, AuditLogger audit) {
         this.repo = repo;
         this.userRepo = userRepo;
+        this.mail = mail;
+        this.audit = audit;
     }
 
     // [스멜8] 파라미터 8개. [스멜9] 이름이 모호하다.
@@ -105,22 +120,10 @@ public class ApprovalService {
         return approval;
     }
 
-    // [매직넘버 제거] Approval.type 코드 중 "지출"만 processApproval에서 참조하므로 이 상수로 대체.
-    // type 필드 자체(1~4 전체)를 enum으로 바꾸는 것은 이번 범위 밖이다.
-    private static final int EXPENSE_TYPE_CODE = 1;
-
-    // [매직넘버 제거] 지출 결재가 이 금액(원) 이상이면 상신 시 우선순위를 자동으로 높인다.
-    private static final long AUTO_PRIORITY_UPGRADE_AMOUNT_THRESHOLD = 1_000_000L;
-
-    // [매직넘버 제거] Approval.priority 코드 중 "높음"만 이 메서드에서 참조하므로 이 상수로 대체.
-    private static final int HIGH_PRIORITY_CODE = 3;
-
-    // [매직넘버 제거] User.role 코드 중 승인/반려 권한 최소 기준("팀장 이상")만 참조하므로 이 상수로 대체.
-    private static final int MIN_ROLE_CODE_FOR_APPROVAL = 2;
-
     /**
      * 결재 처리 — 상신/승인/반려/취소를 action 코드로 분기해 각 처리 메서드에 위임한다.
-     * [스멜1][스멜6] 상태 전이 규칙 계산 자체는 여전히 서비스가 떠안는다(God Class는 별도 과제).
+     * 상태 전이·권한 규칙 자체는 {@link Approval}의 도메인 메서드가 갖고 있고, 여기서는
+     * 조회 + 디스패치 + (성공 시) 저장/알림/감사로그만 담당한다.
      *
      * action: 1=상신, 2=승인, 3=반려, 9=취소
      */
@@ -149,18 +152,10 @@ public class ApprovalService {
         // 조용히 무시된다 — 레거시 동작 보존.
     }
 
-    // 상신: 임시저장 상태일 때만 가능(기안자 본인 확인은 레거시에도 없다 — 동작 보존).
     private void submit(Approval approval, User actor) {
-        if (approval.getStatus() != ApprovalStatus.DRAFT) {
+        if (!approval.submit()) {
             return;
         }
-        // [스멜6] 금액 기준 결재자 자동 상향 — 도메인 규칙이 서비스에 박혀 있다.
-        if (approval.getType() == EXPENSE_TYPE_CODE
-                && approval.getAmount() >= AUTO_PRIORITY_UPGRADE_AMOUNT_THRESHOLD) {
-            approval.setPriority(HIGH_PRIORITY_CODE);
-        }
-        approval.setStatus(ApprovalStatus.SUBMITTED);
-        approval.setUpdatedAt(LocalDateTime.now());
         repo.save(approval);
 
         // [스멜4] 메일 발송 — 본문 생성 로직이 곳곳에 복붙.
@@ -174,69 +169,51 @@ public class ApprovalService {
         writeAudit("APPROVAL SUBMIT", approval.getId(), actor.getId());
     }
 
-    // 승인: 상신 상태 + 본인이 결재자 + 권한(팀장 이상) 일 때만.
     private void approve(Approval approval, User actor) {
-        if (approval.getStatus() != ApprovalStatus.SUBMITTED) {
+        if (!approval.approve(actor)) {
             return;
         }
-        if (approval.getApproverId() == null || !approval.getApproverId().equals(actor.getId())) {
-            return;
-        }
-        if (actor.getRole() < MIN_ROLE_CODE_FOR_APPROVAL) {   // role 1=사원·2=팀장·3=임원 (role>=2 승인권한)
-            return;
-        }
-        approval.setStatus(ApprovalStatus.APPROVED);
-        approval.setUpdatedAt(LocalDateTime.now());
         repo.save(approval);
 
-        // [스멜4] 또 복붙된 메일 발송
         User drafter = userRepo.findById(approval.getDrafterId()).orElse(null);
         if (drafter != null) {
-            String body = "안녕하세요 " + drafter.getName() + "님,\n"
-                    + "결재가 승인되었습니다.\n제목: " + approval.getTitle();
-            mail.send(drafter.getEmail(), "[결재승인] " + approval.getTitle(), body);
+            mail.send(drafter.getEmail(), "[결재승인] " + approval.getTitle(), approvedBody(drafter, approval));
         }
         writeAudit("APPROVAL APPROVE", approval.getId(), actor.getId());
     }
 
-    // 반려: 승인과 전제조건이 완전히 동일하다(상신 상태 + 본인이 결재자 + 권한).
     private void reject(Approval approval, User actor, String reason) {
-        if (approval.getStatus() != ApprovalStatus.SUBMITTED) {
+        if (!approval.reject(actor, reason)) {
             return;
         }
-        if (approval.getApproverId() == null || !approval.getApproverId().equals(actor.getId())) {
-            return;
-        }
-        if (actor.getRole() < MIN_ROLE_CODE_FOR_APPROVAL) {   // role>=2 → 팀장 이상 (위 승인과 똑같은 판정 복붙)
-            return;
-        }
-        approval.setStatus(ApprovalStatus.REJECTED);
-        approval.setRejectReason(reason);
-        approval.setUpdatedAt(LocalDateTime.now());
         repo.save(approval);
 
         User drafter = userRepo.findById(approval.getDrafterId()).orElse(null);
         if (drafter != null) {
-            String body = "안녕하세요 " + drafter.getName() + "님,\n"
-                    + "결재가 반려되었습니다.\n제목: " + approval.getTitle()
-                    + "\n사유: " + reason;
-            mail.send(drafter.getEmail(), "[결재반려] " + approval.getTitle(), body);
+            mail.send(drafter.getEmail(), "[결재반려] " + approval.getTitle(), rejectedBody(drafter, approval, reason));
         }
         writeAudit("APPROVAL REJECT", approval.getId(), actor.getId());
     }
 
-    // 취소: 기안자 본인 + 아직 승인 전(임시저장 또는 상신)일 때만. 승인 권한(role)은 확인하지 않는다.
     private void cancel(Approval approval, User actor) {
-        if (approval.getStatus() != ApprovalStatus.DRAFT && approval.getStatus() != ApprovalStatus.SUBMITTED) {
+        if (!approval.cancel(actor)) {
             return;
         }
-        if (approval.getDrafterId() == null || !approval.getDrafterId().equals(actor.getId())) {
-            return;
-        }
-        approval.setStatus(ApprovalStatus.CANCELED);
-        approval.setUpdatedAt(LocalDateTime.now());
         repo.save(approval);
         writeAudit("APPROVAL CANCEL", approval.getId(), actor.getId());
+    }
+
+    // [리팩토링] Extract Method — approve()에서 분리한 메일 본문 조립.
+    private String approvedBody(User drafter, Approval approval) {
+        return "안녕하세요 " + drafter.getName() + "님,\n"
+                + "결재가 승인되었습니다.\n제목: " + approval.getTitle();
+    }
+
+    // [리팩토링] Extract Method — reject()에서 분리한 메일 본문 조립.
+    private String rejectedBody(User drafter, Approval approval, String reason) {
+        return "안녕하세요 " + drafter.getName() + "님,\n"
+                + "결재가 반려되었습니다.\n제목: " + approval.getTitle()
+                + "\n사유: " + reason;
     }
 
     // [스멜4] 그나마 추출했지만 create() 안에는 또 복붙이 남아 있다(불완전한 중복 제거).
@@ -245,18 +222,17 @@ public class ApprovalService {
         audit.write("[" + now + "] " + act + " id=" + id + " by=" + userId);
     }
 
-    // [리팩토링] 5분기 if-else + tmp 임시변수 제거 → ApprovalStatus.label()에 위임.
+    // [리팩토링] 5분기 if-else + tmp 임시변수 제거 → ApprovalStatus.label()에 위임(Move Method).
+    // 표현(라벨) 규칙은 서비스가 아니라 상태 자신의 책임이라는 판단.
     public String statusLabel(Approval approval) {
         return approval.getStatus().label();
     }
 
-    // [스멜6] Feature Envy — Approval 데이터를 꺼내 금액 등급을 서비스가 계산.
+    // [리팩토링] 스멜6(Feature Envy) 해소 — 금액 등급 계산 로직을 AmountGrade enum으로
+    // 이동(Move Method). "금액이 S/A/B/C 중 무엇인가"는 금액이라는 값 자체의 규칙이지
+    // 서비스의 책임이 아니라는 판단. public 시그니처(Approval → String)는 그대로 유지.
     public String amountGrade(Approval approval) {
-        long amount = approval.getAmount();
-        if (amount >= 10000000) return "S";   // [스멜3] 1000만원=S — 기준 숫자의 의미가 코드에 없음
-        else if (amount >= 1000000) return "A";   // 100만원=A
-        else if (amount >= 100000) return "B";    // 10만원=B
-        else return "C";
+        return AmountGrade.fromAmount(approval.getAmount()).name();
     }
 
     public List<Approval> myDrafts(Long userId) {

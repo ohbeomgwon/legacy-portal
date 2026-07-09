@@ -4,6 +4,8 @@ import com.ktds.portal.approval.domain.Approval;
 import com.ktds.portal.approval.domain.ApprovalStatus;
 import com.ktds.portal.approval.repository.ApprovalRepository;
 import com.ktds.portal.approval.service.ApprovalService;
+import com.ktds.portal.common.FileAuditLogger;
+import com.ktds.portal.common.SmtpMailSender;
 import com.ktds.portal.user.User;
 import com.ktds.portal.user.UserRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -24,11 +26,12 @@ import static org.assertj.core.api.Assertions.assertThatCode;
  * 옳고 그름을 판단하지 않는다 — 권한 없는 승인이 조용히 무시되는 것도, 존재하지 않는 id를 던져도
  * 예외가 없는 것도 "현재 레거시가 그렇게 동작한다"는 사실만 고정한다.
  *
- * @DataJpaTest 는 JPA 슬라이스 테스트라 @Service 빈을 기본적으로 스캔하지 않으므로,
- * ApprovalService 를 @Import 로 컨텍스트에 직접 올리고 @Autowired 로만 주입받는다(직접 new 금지).
+ * @DataJpaTest 는 JPA 슬라이스 테스트라 @Service/@Component 빈을 기본적으로 스캔하지 않으므로,
+ * ApprovalService 와 그 협력자(MailSender/AuditLogger 구현체)를 @Import 로 컨텍스트에 직접
+ * 올리고 @Autowired 로만 주입받는다(직접 new 금지).
  */
 @DataJpaTest
-@Import(ApprovalService.class)
+@Import({ApprovalService.class, SmtpMailSender.class, FileAuditLogger.class})
 class ApprovalServiceProcessApprovalCharacterizationTest {
 
     @Autowired
